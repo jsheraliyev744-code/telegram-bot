@@ -67,6 +67,7 @@ def get_language(user_id):
             "SELECT language FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
+
     return row[0] if row else None
 
 
@@ -102,6 +103,7 @@ TEXTS = {
         "error": "⚠️ Videoni yuklab bo'lmadi. Boshqa havolani sinab ko'ring.",
         "large": "⚠️ Video hajmi 45 MB dan katta."
     },
+
     "ru": {
         "welcome": (
             "👋 Здравствуйте!\n\n"
@@ -117,6 +119,7 @@ TEXTS = {
         "error": "⚠️ Не удалось загрузить видео. Попробуйте другую ссылку.",
         "large": "⚠️ Видео слишком большое. Максимум 45 МБ."
     },
+
     "en": {
         "welcome": (
             "👋 Hello!\n\n"
@@ -209,15 +212,17 @@ def valid_url(url):
             host == domain or host.endswith("." + domain)
             for domain in DOMAINS
         )
+
     except Exception:
         return False
 
 
 # ==============================
-# DOWNLOAD
+# DOWNLOAD VIDEO
 # ==============================
 
 def download_video(url, folder):
+
     options = {
         "outtmpl": str(Path(folder) / "%(id)s.%(ext)s"),
         "format": "best[ext=mp4]/best",
@@ -231,6 +236,7 @@ def download_video(url, folder):
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
+
         info = ydl.extract_info(url, download=True)
 
         file_path = Path(
@@ -239,8 +245,10 @@ def download_video(url, folder):
 
         if not file_path.exists():
             files = list(Path(folder).glob(info["id"] + ".*"))
+
             if not files:
                 raise FileNotFoundError("Video file not found")
+
             file_path = files[0]
 
         if file_path.stat().st_size > MAX_SIZE:
@@ -254,6 +262,7 @@ def download_video(url, folder):
 # ==============================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     message = update.effective_message
     user_id = update.effective_user.id
 
@@ -272,15 +281,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(TEXTS[language]["invalid"])
         return
 
-    status = await message.reply_text(TEXTS[language]["loading"])
+    status = await message.reply_text(
+        TEXTS[language]["loading"]
+    )
 
     try:
+
         with tempfile.TemporaryDirectory() as folder:
+
             file_path, title = await asyncio.to_thread(
-                download_video, url, folder
+                download_video,
+                url,
+                folder
             )
 
             with open(file_path, "rb") as video:
+
                 await message.reply_video(
                     video=video,
                     caption="🎬 " + title[:900],
@@ -291,14 +307,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pool_timeout=60
                 )
 
-        await status.edit_text(TEXTS[language]["done"])
+        await status.edit_text(
+            TEXTS[language]["done"]
+        )
 
     except ValueError:
-        await status.edit_text(TEXTS[language]["large"])
+        await status.edit_text(
+            TEXTS[language]["large"]
+        )
 
     except Exception:
         logger.exception("Video download failed")
-        await status.edit_text(TEXTS[language]["error"])
+
+        await status.edit_text(
+            TEXTS[language]["error"]
+        )
 
 
 # ==============================
@@ -306,6 +329,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==============================
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     language = get_language(update.effective_user.id) or "uz"
 
     messages = {
@@ -316,6 +340,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "3. Videoni qabul qiling.\n\n"
             "/language - tilni o'zgartirish"
         ),
+
         "ru": (
             "📌 Как пользоваться ботом:\n"
             "1. Отправьте ссылку.\n"
@@ -323,6 +348,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "3. Получите видео.\n\n"
             "/language - изменить язык"
         ),
+
         "en": (
             "📌 How to use:\n"
             "1. Send a video link.\n"
@@ -332,7 +358,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     }
 
-    await update.effective_message.reply_text(messages[language])
+    await update.effective_message.reply_text(
+        messages[language]
+    )
+
+
+# ==============================
+# ERROR HANDLER
+# ==============================
+
+async def error_handler(update, context):
+    logger.error(
+        "Telegram update error: %s",
+        context.error,
+        exc_info=context.error
+    )
 
 
 # ==============================
@@ -344,14 +384,16 @@ def home():
     return "Telegram Downloader Bot is running!", 200
 
 
+@app.route("/health")
+def health():
+    return "OK", 200
+
+
 # ==============================
 # RUN BOT
 # ==============================
 
 def run_bot():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is missing!")
-        return
 
     init_db()
 
@@ -366,7 +408,7 @@ def run_bot():
     updates_request = HTTPXRequest(
         connection_pool_size=5,
         connect_timeout=60,
-        read_timeout=60,
+        read_timeout=120,
         write_timeout=60,
         pool_timeout=60
     )
@@ -379,9 +421,17 @@ def run_bot():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("language", language_command))
-    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("language", language_command)
+    )
+
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
 
     application.add_handler(
         CallbackQueryHandler(
@@ -397,11 +447,15 @@ def run_bot():
         )
     )
 
+    application.add_error_handler(error_handler)
+
     logger.info("Telegram bot is starting...")
 
     application.run_polling(
-        drop_pending_updates=True,
-        timeout=30
+        drop_pending_updates=False,
+        timeout=30,
+        bootstrap_retries=-1,
+        stop_signals=None
     )
 
 
@@ -409,19 +463,7 @@ def run_bot():
 # MAIN
 # ==============================
 
-if __name__ == "__main__":
-
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is missing! Add it in Render Environment."
-        )
-
-    bot_thread = threading.Thread(
-        target=run_bot,
-        daemon=True,
-        name="telegram-bot"
-    )
-    bot_thread.start()
+def run_flask():
 
     port = int(os.environ.get("PORT", 10000))
 
@@ -432,5 +474,24 @@ if __name__ == "__main__":
         port=port,
         debug=False,
         use_reloader=False
-)
-    
+    )
+
+
+if __name__ == "__main__":
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing! Add it in Render Environment."
+        )
+
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True,
+        name="flask-server"
+    )
+
+    flask_thread.start()
+
+    logger.info("Starting Telegram bot...")
+
+    run_bot()
