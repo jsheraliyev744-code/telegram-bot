@@ -1,5 +1,4 @@
-
-python-telegram-bot>=20.0
-Flask
+python-telegram-bot>=21.10,<23
+Flask>=3.0,<4.0
 yt-dlp
-httpx
+imageio-ffmpeg
