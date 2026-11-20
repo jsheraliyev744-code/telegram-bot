@@ -1,6 +1,5 @@
 
-python-telegram-bot==21.10
-yt-dlp
+python-telegram-bot>=20.0
 Flask
+yt-dlp
 httpx
-gunicorn
