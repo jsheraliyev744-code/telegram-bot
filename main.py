@@ -1,762 +1,814 @@
 
 import os
 import re
-import sqlite3
+import uuid
 import asyncio
 import logging
 import tempfile
-import threading
-
 from pathlib import Path
 from urllib.parse import urlparse
 
 import yt_dlp
-import imageio_ffmpeg
 
-from flask import Flask
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError
-from telegram.request import HTTPXRequest
-
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 
-# ==================================================
-# SETTINGS
-# ==================================================
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-MAX_SIZE = 45 * 1024 * 1024
-DB_FILE = "users.db"
-
-SEARCH_LIMIT = 15
-PAGE_SIZE = 10
-MAX_DOWNLOADS = 3
-
-PORT = int(os.getenv("PORT", "10000"))
-
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-
-web_app = Flask(__name__)
+MAX_CONCURRENT = 3
+MAX_FILE_SIZE = 48 * 1024 * 1024
 
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 
 logger = logging.getLogger(__name__)
 
-DOMAINS = {
-    "youtube.com",
-    "youtu.be",
-    "instagram.com",
-    "tiktok.com",
-    "vm.tiktok.com",
-    "vt.tiktok.com",
-    "pinterest.com",
-    "pin.it",
-}
+semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-# ==================================================
-# DATABASE
-# ==================================================
-
-def init_db():
-    with sqlite3.connect(DB_FILE) as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                language TEXT DEFAULT 'uz'
-            )
-        """)
-        db.commit()
-
-
-def get_language(user_id):
-    with sqlite3.connect(DB_FILE) as db:
-        row = db.execute(
-            "SELECT language FROM users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-
-    return row[0] if row else None
-
-
-def save_language(user_id, language):
-    with sqlite3.connect(DB_FILE) as db:
-        db.execute("""
-            INSERT INTO users(user_id, language)
-            VALUES (?, ?)
-            ON CONFLICT(user_id)
-            DO UPDATE SET language=excluded.language
-        """, (user_id, language))
-        db.commit()
-
-
-# ==================================================
+# ==========================================
 # LANGUAGES
-# ==================================================
+# ==========================================
 
 TEXTS = {
     "uz": {
         "welcome": (
             "👋 Assalomu alaykum!\n\n"
-            "🎵 Qo'shiq nomini yozing.\n"
-            "🎬 Yoki video havolasini yuboring.\n\n"
-            "YouTube, Instagram, TikTok va Pinterest qo'llab-quvvatlanadi."
+            "🎬 Men video yuklovchi botman.\n"
+            "🎵 Qo'shiq nomini yozib musiqa topishingiz mumkin.\n\n"
+            "📥 Menga video havolasini yuboring yoki "
+            "qo'shiq nomini yozing."
         ),
-        "searching": "⏳ Qo'shiq qidirilmoqda...",
-        "downloading": "⏳ Yuklanmoqda, kuting...",
-        "results": "🎵 Qidiruv natijalari:\n\n",
-        "not_found": "⚠️ Hech narsa topilmadi.",
-        "invalid": "❌ Bu havola qo'llab-quvvatlanmaydi.",
-        "video_error": "⚠️ Videoni yuklab bo'lmadi. Boshqa havolani sinab ko'ring.",
-        "song_error": "⚠️ Qo'shiqni yuklab bo'lmadi.",
-        "large": "⚠️ Fayl 45 MB dan katta.",
-        "cancelled": "❌ Qidiruv bekor qilindi.",
-        "choose": "🌍 Tilni tanlang:",
-        "selected": "✅ O'zbek tili tanlandi!",
-        "help": (
-            "📌 Botdan foydalanish:\n\n"
-            "1. Qo'shiq nomini yozing.\n"
-            "2. Kerakli raqamni bosing.\n"
-            "3. MP3 faylni oling.\n\n"
-            "Yoki video havolasini yuboring.\n\n"
-            "/start - boshlash\n"
-            "/language - til\n"
-            "/help - yordam"
-        ),
+        "video": "🎬 Video yuklash",
+        "music": "🎵 Musiqa qidirish",
+        "language": "🌐 Tilni o'zgartirish",
+        "choose": "🌐 Tilni tanlang:",
+        "waiting": "⏳ Yuklanmoqda, kuting...",
+        "searching": "🔎 Qo'shiqlar qidirilmoqda...",
+        "not_found": "❌ Hech narsa topilmadi.",
+        "error": "❌ Xatolik yuz berdi. Boshqa havola yuboring.",
+        "done": "✅ Tayyor!",
+        "send_link": "🔗 Video havolasini yuboring.",
+        "send_song": "🎵 Qo'shiq nomini yozing:",
+        "results": "🎶 Topilgan qo'shiqlar:",
+        "audio": "🎵 Videodan audio olish",
+        "unsupported": "❌ Bu havola qo'llab-quvvatlanmaydi.",
+        "too_large": "❌ Fayl juda katta. Boshqa sifatni sinab ko'ring.",
+        "choose_song": "👇 Yuklab olish uchun qo'shiqni tanlang:",
+        "help": "Video havolasi yuboring yoki qo'shiq nomini yozing."
     },
-
     "ru": {
         "welcome": (
-            "👋 Здравствуйте!\n\n"
-            "🎵 Напишите название песни.\n"
-            "🎬 Или отправьте ссылку на видео."
+            "👋 Добро пожаловать!\n\n"
+            "🎬 Я бот для скачивания видео.\n"
+            "🎵 Также могу искать музыку.\n\n"
+            "📥 Отправьте ссылку на видео или название песни."
         ),
-        "searching": "⏳ Ищу песню...",
-        "downloading": "⏳ Загружаю, подождите...",
-        "results": "🎵 Результаты поиска:\n\n",
-        "not_found": "⚠️ Ничего не найдено.",
-        "invalid": "❌ Эта ссылка не поддерживается.",
-        "video_error": "⚠️ Не удалось скачать видео.",
-        "song_error": "⚠️ Не удалось скачать песню.",
-        "large": "⚠️ Файл больше 45 МБ.",
-        "cancelled": "❌ Поиск отменён.",
-        "choose": "🌍 Выберите язык:",
-        "selected": "✅ Русский язык выбран!",
-        "help": (
-            "Отправьте ссылку или название песни.\n"
-            "/start - начало\n"
-            "/language - язык\n"
-            "/help - помощь"
-        ),
+        "video": "🎬 Скачать видео",
+        "music": "🎵 Найти музыку",
+        "language": "🌐 Изменить язык",
+        "choose": "🌐 Выберите язык:",
+        "waiting": "⏳ Загрузка, пожалуйста подождите...",
+        "searching": "🔎 Ищу музыку...",
+        "not_found": "❌ Ничего не найдено.",
+        "error": "❌ Произошла ошибка. Попробуйте другую ссылку.",
+        "done": "✅ Готово!",
+        "send_link": "🔗 Отправьте ссылку на видео.",
+        "send_song": "🎵 Напишите название песни:",
+        "results": "🎶 Найденные песни:",
+        "audio": "🎵 Скачать аудио из видео",
+        "unsupported": "❌ Эта ссылка не поддерживается.",
+        "too_large": "❌ Файл слишком большой.",
+        "choose_song": "👇 Выберите песню для скачивания:",
+        "help": "Отправьте ссылку или название песни."
     },
-
     "en": {
         "welcome": (
-            "👋 Hello!\n\n"
-            "🎵 Type a song name.\n"
-            "🎬 Or send a video link."
+            "👋 Welcome!\n\n"
+            "🎬 I am a video downloader bot.\n"
+            "🎵 I can also search for music.\n\n"
+            "📥 Send a video link or a song name."
         ),
-        "searching": "⏳ Searching for a song...",
-        "downloading": "⏳ Downloading, please wait...",
-        "results": "🎵 Search results:\n\n",
-        "not_found": "⚠️ Nothing found.",
-        "invalid": "❌ Unsupported link.",
-        "video_error": "⚠️ Video download failed.",
-        "song_error": "⚠️ Song download failed.",
-        "large": "⚠️ File is larger than 45 MB.",
-        "cancelled": "❌ Search cancelled.",
-        "choose": "🌍 Choose language:",
-        "selected": "✅ English selected!",
-        "help": (
-            "Send a video link or song name.\n"
-            "/start - start\n"
-            "/language - language\n"
-            "/help - help"
-        ),
-    },
+        "video": "🎬 Download video",
+        "music": "🎵 Search music",
+        "language": "🌐 Change language",
+        "choose": "🌐 Choose your language:",
+        "waiting": "⏳ Downloading, please wait...",
+        "searching": "🔎 Searching for songs...",
+        "not_found": "❌ Nothing found.",
+        "error": "❌ An error occurred. Try another link.",
+        "done": "✅ Done!",
+        "send_link": "🔗 Send a video link.",
+        "send_song": "🎵 Enter a song name:",
+        "results": "🎶 Found songs:",
+        "audio": "🎵 Extract audio from video",
+        "unsupported": "❌ This link is not supported.",
+        "too_large": "❌ File is too large.",
+        "choose_song": "👇 Choose a song to download:",
+        "help": "Send a video link or song name."
+    }
 }
 
 
-# ==================================================
+def lang(context):
+    return context.user_data.get("lang", "uz")
+
+
+def tr(context, key):
+    return TEXTS[lang(context)][key]
+
+
+# ==========================================
 # KEYBOARDS
-# ==================================================
+# ==========================================
+
+def main_keyboard(context):
+    return ReplyKeyboardMarkup(
+        [
+            [tr(context, "video"), tr(context, "music")],
+            [tr(context, "language")]
+        ],
+        resize_keyboard=True
+    )
+
 
 def language_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇺🇿 O'zbekcha", callback_data="lang_uz")],
-        [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
-        [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
+        [
+            InlineKeyboardButton("🇺🇿 O'zbekcha", callback_data="lang_uz"),
+            InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")
+        ],
+        [
+            InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")
+        ]
     ])
 
 
-def results_keyboard(results, page):
-    start = page * PAGE_SIZE
-    current = results[start:start + PAGE_SIZE]
-    rows = []
+# ==========================================
+# URL VALIDATION
+# ==========================================
 
-    for row_start in range(0, len(current), 5):
-        row = []
-
-        for i in range(row_start, min(row_start + 5, len(current))):
-            index = start + i
-
-            row.append(
-                InlineKeyboardButton(
-                    str(i + 1),
-                    callback_data=f"song_pick_{index}"
-                )
-            )
-
-        rows.append(row)
-
-    navigation = []
-
-    if page > 0:
-        navigation.append(
-            InlineKeyboardButton("⬅️", callback_data="song_prev")
-        )
-
-    navigation.append(
-        InlineKeyboardButton("❌", callback_data="song_cancel")
-    )
-
-    if start + PAGE_SIZE < len(results):
-        navigation.append(
-            InlineKeyboardButton("➡️", callback_data="song_next")
-        )
-
-    rows.append(navigation)
-
-    return InlineKeyboardMarkup(rows)
-
-
-# ==================================================
-# URL HELPERS
-# ==================================================
-
-def extract_url(text):
-    match = re.search(r"https?://[^\s<>]+", text or "")
-
-    if not match:
-        return None
-
-    return match.group(0).rstrip(".,!?)']\"}")
+SUPPORTED_DOMAINS = (
+    "youtube.com",
+    "youtu.be",
+    "instagram.com",
+    "tiktok.com",
+    "pinterest.com",
+    "pin.it",
+)
 
 
 def valid_url(url):
     try:
-        parsed = urlparse(url.strip())
-
-        if parsed.scheme not in ("http", "https"):
-            return False
-
+        parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
 
-        return any(
-            host == domain or host.endswith("." + domain)
-            for domain in DOMAINS
+        return (
+            parsed.scheme in ("http", "https")
+            and any(
+                host == domain or host.endswith("." + domain)
+                for domain in SUPPORTED_DOMAINS
+            )
         )
-
     except Exception:
         return False
 
 
-# ==================================================
-# DOWNLOAD HELPERS
-# ==================================================
+# ==========================================
+# YT-DLP OPTIONS
+# ==========================================
 
-def find_file(folder, video_id):
-    files = [
-        f for f in Path(folder).glob(video_id + ".*")
-        if f.is_file()
-        and not f.name.endswith((".part", ".ytdl"))
-    ]
-
-    if not files:
-        raise FileNotFoundError("Downloaded file not found")
-
-    return max(files, key=lambda f: f.stat().st_size)
-
-
-def download_video(url, folder):
+def base_options(folder):
     options = {
         "outtmpl": str(Path(folder) / "%(id)s.%(ext)s"),
-        "format": "best[ext=mp4]/best",
-        "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "socket_timeout": 25,
+        "noplaylist": True,
+        "ignoreerrors": False,
         "retries": 3,
         "fragment_retries": 3,
-        "max_filesize": MAX_SIZE,
-        "concurrent_fragment_downloads": 8,
-        "buffersize": 1024 * 256,
-        "http_chunk_size": 10 * 1024 * 1024,
+        "socket_timeout": 20,
+        "concurrent_fragment_downloads": 4,
+        "overwrites": True,
     }
+
+    # Optional cookies for content accessible through
+    # the user's own authorized account.
+    cookies = os.getenv("COOKIES_FILE")
+    if cookies and Path(cookies).is_file():
+        options["cookiefile"] = cookies
+
+    return options
+
+
+# ==========================================
+# DOWNLOAD VIDEO
+# ==========================================
+
+def download_video_sync(url, folder):
+    options = base_options(folder)
+
+    options.update({
+        "format": (
+            "best[filesize<48M][height<=720]/"
+            "best[height<=480]/best"
+        ),
+        "merge_output_format": "mp4",
+    })
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
+        title = info.get("title", "Video")
 
-        file_path = find_file(
-            folder,
-            str(info["id"])
-        )
+    files = [
+        p for p in Path(folder).iterdir()
+        if p.is_file()
+        and not p.name.endswith((".part", ".ytdl"))
+        and not p.name.endswith(".json")
+    ]
 
-    if file_path.stat().st_size > MAX_SIZE:
-        raise ValueError("large")
+    if not files:
+        raise FileNotFoundError("Downloaded video not found")
 
-    return file_path, info.get("title", "Video")
+    file_path = max(files, key=lambda p: p.stat().st_size)
 
-
-# ==================================================
-# SONG SEARCH
-# ==================================================
-
-def search_songs(query):
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extract_flat": "in_playlist",
-        "socket_timeout": 15,
-        "retries": 2,
-    }
-
-    with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(
-            f"ytsearch{SEARCH_LIMIT}:{query}",
-            download=False
-        )
-
-    results = []
-
-    for item in (info or {}).get("entries", []) or []:
-        if not item or not item.get("id"):
-            continue
-
-        video_id = str(item["id"])
-
-        results.append({
-            "id": video_id,
-            "title": str(item.get("title") or "Unknown")[:180],
-            "url": (
-                item.get("webpage_url")
-                or f"https://www.youtube.com/watch?v={video_id}"
-            ),
-            "duration": item.get("duration"),
-        })
-
-    return results
+    return str(file_path), title
 
 
-# ==================================================
-# SONG DOWNLOAD
-# ==================================================
+# ==========================================
+# DOWNLOAD MP3
+# ==========================================
 
-def download_song(url, folder):
-    options = {
-        "outtmpl": str(Path(folder) / "%(id)s.%(ext)s",
-        ),
+def download_audio_sync(url, folder):
+    options = base_options(folder)
+
+    options.update({
         "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 25,
-        "retries": 3,
-        "fragment_retries": 3,
-        "max_filesize": MAX_SIZE,
-        "concurrent_fragment_downloads": 8,
-        "buffersize": 1024 * 256,
-        "ffmpeg_location": FFMPEG_PATH,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }],
-    }
+    })
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
+        title = info.get("title", "Music")
 
-        video_id = str(info["id"])
-        expected = Path(folder) / (video_id + ".mp3")
+    files = list(Path(folder).glob("*.mp3"))
 
-        if expected.exists():
-            file_path = expected
-        else:
-            file_path = find_file(folder, video_id)
+    if not files:
+        raise FileNotFoundError("MP3 not found")
 
-    if file_path.stat().st_size > MAX_SIZE:
-        raise ValueError("large")
+    file_path = max(files, key=lambda p: p.stat().st_size)
 
-    return (
-        file_path,
-        info.get("title", "Audio"),
-        info.get("uploader", "")
-    )
+    return str(file_path), title
 
 
-# ==================================================
-# TEXT HELPERS
-# ==================================================
+# ==========================================
+# SEARCH UP TO 10 SONGS
+# ==========================================
 
-def duration_text(seconds):
-    if not seconds:
-        return ""
+def search_music_sync(query):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
 
-    seconds = int(seconds)
-    minutes, secs = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-
-    return f"{minutes}:{secs:02d}"
-
-
-def make_results_text(results, page, language):
-    start = page * PAGE_SIZE
-    current = results[start:start + PAGE_SIZE]
-
-    lines = [TEXTS[language]["results"]]
-
-    for index, item in enumerate(current, 1):
-        duration = duration_text(item.get("duration"))
-        suffix = f" {duration}" if duration else ""
-        title = item["title"].replace("\n", " ")
-
-        lines.append(f"{index}. {title}{suffix}")
-
-    return "\n".join(lines)
-
-
-# ==================================================
-# COMMANDS
-# ==================================================
-
-async def start(update, context):
-    user_id = update.effective_user.id
-    language = get_language(user_id)
-
-    if not language:
-        await update.effective_message.reply_text(
-            "🌍 Tilni tanlang / Choose language:",
-            reply_markup=language_keyboard()
+    with yt_dlp.YoutubeDL(options) as ydl:
+        data = ydl.extract_info(
+            "ytsearch10:" + query,
+            download=False
         )
-        return
 
-    await update.effective_message.reply_text(
-        TEXTS[language]["welcome"]
+    results = []
+
+    for item in (data.get("entries") or []):
+        if not item:
+            continue
+
+        video_url = item.get("url")
+
+        if not video_url or not str(video_url).startswith("http"):
+            video_url = item.get("webpage_url")
+
+        if not video_url and item.get("id"):
+            video_url = (
+                "https://www.youtube.com/watch?v="
+                + item["id"]
+            )
+
+        if not video_url:
+            continue
+
+        results.append({
+            "title": item.get("title", "Unknown"),
+            "url": video_url,
+            "duration": item.get("duration"),
+        })
+
+    return results[:10]
+
+
+# ==========================================
+# TEMPORARY DOWNLOAD
+# ==========================================
+
+async def process_download(url, audio=False):
+    temp = tempfile.TemporaryDirectory(prefix="songbot_")
+
+    try:
+        async with semaphore:
+            loop = asyncio.get_running_loop()
+
+            if audio:
+                result = await loop.run_in_executor(
+                    None,
+                    download_audio_sync,
+                    url,
+                    temp.name
+                )
+            else:
+                result = await loop.run_in_executor(
+                    None,
+                    download_video_sync,
+                    url,
+                    temp.name
+                )
+
+        return temp, result
+
+    except Exception:
+        temp.cleanup()
+        raise
+
+
+# ==========================================
+# START
+# ==========================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        tr(context, "welcome"),
+        reply_markup=main_keyboard(context)
     )
 
 
-async def language_command(update, context):
-    language = get_language(update.effective_user.id) or "uz"
+# ==========================================
+# LANGUAGE
+# ==========================================
 
-    await update.effective_message.reply_text(
-        TEXTS[language]["choose"],
+async def language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        tr(context, "choose"),
         reply_markup=language_keyboard()
     )
 
 
-async def help_command(update, context):
-    language = get_language(update.effective_user.id) or "uz"
-
-    await update.effective_message.reply_text(
-        TEXTS[language]["help"]
-    )
-
-
-async def language_callback(update, context):
+async def language_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     query = update.callback_query
     await query.answer()
 
-    language = query.data.replace("lang_", "", 1)
+    selected = query.data.replace("lang_", "")
 
-    if language not in TEXTS:
+    if selected not in TEXTS:
         return
 
-    save_language(query.from_user.id, language)
+    context.user_data["lang"] = selected
 
     await query.edit_message_text(
-        TEXTS[language]["selected"]
-        + "\n\n"
-        + TEXTS[language]["welcome"]
+        TEXTS[selected]["welcome"]
+    )
+
+    await query.message.reply_text(
+        TEXTS[selected]["done"],
+        reply_markup=main_keyboard(context)
     )
 
 
-# ==================================================
-# STATUS HELPER
-# ==================================================
+# ==========================================
+# VIDEO DOWNLOAD HANDLER
+# ==========================================
 
-async def delete_status(status):
+async def handle_video(url, update, context):
+    waiting = await update.message.reply_text(
+        tr(context, "waiting")
+    )
+
+    temp = None
+
     try:
-        await status.delete()
-    except TelegramError:
-        pass
+        temp, (file_path, title) = await process_download(
+            url,
+            audio=False
+        )
 
+        size = os.path.getsize(file_path)
 
-# ==================================================
-# MAIN MESSAGE HANDLER
-# ==================================================
-
-async def handle_message(update, context):
-    message = update.effective_message
-    user_id = update.effective_user.id
-
-    language = get_language(user_id) or "uz"
-    message_text = (message.text or "").strip()
-
-    url = extract_url(message_text)
-    semaphore = context.application.bot_data["semaphore"]
-
-    # VIDEO DOWNLOAD
-
-    if url:
-        if not valid_url(url):
-            await message.reply_text(
-                TEXTS[language]["invalid"]
+        if size > MAX_FILE_SIZE:
+            await waiting.edit_text(
+                tr(context, "too_large")
             )
             return
 
-        status = await message.reply_text(
-            TEXTS[language]["downloading"]
+        with open(file_path, "rb") as video:
+            await update.message.reply_video(
+                video=video,
+                caption=f"🎬 {title[:900]}",
+                supports_streaming=True,
+                read_timeout=120,
+                write_timeout=120,
+                connect_timeout=30
+            )
+
+        # Store URL for the audio extraction button.
+        key = uuid.uuid4().hex[:12]
+
+        context.user_data.setdefault("jobs", {})[key] = url
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                tr(context, "audio"),
+                callback_data=f"aud_{key}"
+            )
+        ]])
+
+        await update.message.reply_text(
+            tr(context, "done"),
+            reply_markup=keyboard
         )
+
+    except Exception as error:
+        logger.exception("Video download error: %s", error)
+
+        await update.message.reply_text(
+            tr(context, "error")
+        )
+
+    finally:
+        if temp:
+            temp.cleanup()
 
         try:
-            async with semaphore:
-                with tempfile.TemporaryDirectory() as folder:
-                    file_path, title = await asyncio.to_thread(
-                        download_video,
-                        url,
-                        folder
-                    )
-
-                    with open(file_path, "rb") as media:
-                        if file_path.suffix.lower() == ".mp4":
-                            await message.reply_video(
-                                video=media,
-                                caption=("🎬 " + title)[:900],
-                                supports_streaming=True,
-                                read_timeout=180,
-                                write_timeout=180,
-                                connect_timeout=30,
-                                pool_timeout=60,
-                            )
-                        else:
-                            await message.reply_document(
-                                document=media,
-                                filename=file_path.name,
-                                caption=("🎬 " + title)[:900],
-                                read_timeout=180,
-                                write_timeout=180,
-                                connect_timeout=30,
-                                pool_timeout=60,
-                            )
-
-            await delete_status(status)
-
-        except ValueError:
-            await status.edit_text(
-                TEXTS[language]["large"]
-            )
-
+            await waiting.delete()
         except Exception:
-            logger.exception("Video download failed")
+            pass
 
-            await status.edit_text(
-                TEXTS[language]["video_error"]
-            )
 
-        return
+# ==========================================
+# AUDIO EXTRACTION CALLBACK
+# ==========================================
 
-    # SONG SEARCH
+async def audio_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
 
-    if len(message_text) < 2:
-        await message.reply_text(
-            TEXTS[language]["not_found"]
+    key = query.data.replace("aud_", "")
+
+    url = context.user_data.get("jobs", {}).get(key)
+
+    if not url:
+        await query.message.reply_text(
+            tr(context, "error")
         )
         return
 
-    status = await message.reply_text(
-        TEXTS[language]["searching"]
+    # Avoid duplicate callback downloads.
+    context.user_data["jobs"].pop(key, None)
+
+    waiting = await query.message.reply_text(
+        tr(context, "waiting")
     )
 
+    temp = None
+
     try:
-        results = await asyncio.to_thread(
-            search_songs,
-            message_text
+        temp, (file_path, title) = await process_download(
+            url,
+            audio=True
         )
 
-        if not results:
-            await delete_status(status)
-
-            await message.reply_text(
-                TEXTS[language]["not_found"]
+        if os.path.getsize(file_path) > MAX_FILE_SIZE:
+            await query.message.reply_text(
+                tr(context, "too_large")
             )
             return
 
-        context.user_data["song_results"] = results
-        context.user_data["song_page"] = 0
+        with open(file_path, "rb") as audio:
+            await query.message.reply_audio(
+                audio=audio,
+                title=title[:64],
+                filename="music.mp3",
+                read_timeout=120,
+                write_timeout=120
+            )
 
-        await delete_status(status)
+    except Exception as error:
+        logger.exception("Audio extraction error: %s", error)
 
-        await message.reply_text(
-            make_results_text(results, 0, language),
-            reply_markup=results_keyboard(results, 0),
-            disable_web_page_preview=True,
+        await query.message.reply_text(
+            tr(context, "error")
         )
 
-    except Exception:
-        logger.exception("Song search failed")
+    finally:
+        if temp:
+            temp.cleanup()
 
-        await delete_status(status)
+        try:
+            await waiting.delete()
+        except Exception:
+            pass
 
-        await message.reply_text(
-            TEXTS[language]["not_found"]
-        )
 
+# ==========================================
+# SONG SEARCH HANDLER
+# ==========================================
 
-# ==================================================
-# SONG BUTTON HANDLER
-# ==================================================
-
-async def song_callback(update, context):
-    query = update.callback_query
-
-    language = get_language(query.from_user.id) or "uz"
-    data = query.data
-
-    results = context.user_data.get("song_results", [])
-
-    if data == "song_cancel":
-        await query.answer()
-
-        context.user_data.pop("song_results", None)
-        context.user_data.pop("song_page", None)
-
-        await query.edit_message_text(
-            TEXTS[language]["cancelled"]
-        )
-        return
-
-    if not results:
-        await query.answer(
-            "Qidiruv eskirgan. Qayta qidiring.",
-            show_alert=True
-        )
-        return
-
-    page = int(context.user_data.get("song_page", 0))
-
-    if data == "song_prev":
-        await query.answer()
-
-        page = max(0, page - 1)
-        context.user_data["song_page"] = page
-
-        await query.edit_message_text(
-            make_results_text(results, page, language),
-            reply_markup=results_keyboard(results, page),
-            disable_web_page_preview=True,
-        )
-        return
-
-    if data == "song_next":
-        await query.answer()
-
-        max_page = (len(results) - 1) // PAGE_SIZE
-        page = min(max_page, page + 1)
-
-        context.user_data["song_page"] = page
-
-        await query.edit_message_text(
-            make_results_text(results, page, language),
-            reply_markup=results_keyboard(results, page),
-            disable_web_page_preview=True,
-        )
-        return
-
-    match = re.fullmatch(r"song_pick_(\d+)", data)
-
-    if not match:
-        await query.answer()
-        return
-
-    index = int(match.group(1))
-
-    if index < 0 or index >= len(results):
-        await query.answer(
-            "Natija topilmadi.",
-            show_alert=True
-        )
-        return
-
-    await query.answer()
-
-    selected = results[index]
-
-    try:
-        await query.edit_message_reply_markup(
-            reply_markup=None
-        )
-    except TelegramError:
-        pass
-
-    status = await query.message.reply_text(
-        TEXTS[language]["downloading"]
+async def handle_search(
+    query_text,
+    update,
+    context
+):
+    waiting = await update.message.reply_text(
+        tr(context, "searching")
     )
 
-    semaphore = context.application.bot_data["semaphore"]
+    try:
+        loop = asyncio.get_running_loop()
+
+        async with semaphore:
+            results = await loop.run_in_executor(
+                None,
+                search_music_sync,
+                query_text
+            )
+
+        if not results:
+            await waiting.edit_text(
+                tr(context, "not_found")
+            )
+            return
+
+        buttons = []
+        jobs = {}
+
+        for index, item in enumerate(results, 1):
+            key = uuid.uuid4().hex[:10]
+            jobs[key] = item["url"]
+
+            title = item["title"][:45]
+
+            buttons.append([
+                InlineKeyboardButton(
+                    f"🎵 {index}. {title}",
+                    callback_data=f"song_{key}"
+                )
+            ])
+
+        context.user_data["song_jobs"] = jobs
+
+        await waiting.edit_text(
+            tr(context, "choose_song"),
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    except Exception as error:
+        logger.exception("Music search error: %s", error)
+
+        await waiting.edit_text(
+            tr(context, "error")
+        )
+
+
+# ==========================================
+# SONG DOWNLOAD CALLBACK
+# ==========================================
+
+async def song_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    key = query.data.replace("song_", "")
+
+    url = context.user_data.get(
+        "song_jobs", {}
+    ).get(key)
+
+    if not url:
+        await query.message.reply_text(
+            tr(context, "error")
+        )
+        return
+
+    context.user_data["song_jobs"].pop(key, None)
+
+    waiting = await query.message.reply_text(
+        tr(context, "waiting")
+    )
+
+    temp = None
 
     try:
-        async with semaphore:
-            with tempfile.TemporaryDirectory() as folder:
-                file_path, title, performer = await asyncio.to_thread(
-                    download_song,
-                    selected["url"],
-                    folder
-                )
-
-                with open(file_path, "rb") as audio:
-                    await query.message.reply_audio(
-                        audio=audio,
-                        title=title[:64],
-                        performer=performer[:64] if performer else None,
-                        filename="song.mp3",
-                        read_timeout=180,
-                        write_timeout=180,
-                        connect_timeout=30,
-                        pool_timeout=60,
-                    )
-
-        await delete_status(status)
-
-    except ValueError:
-        await status.edit_text(
-            TEXTS[language]["large"]
+        temp, (file_path, title) = await process_download(
+            url,
+            audio=True
         )
 
-    except Exception:
-        logger.exception("Song download failed")
+        if os.path.getsize(file_path) > MAX_FILE_SIZE:
+            await query.message.reply_text(
+                tr(context, "too_large")
+            )
+            return
 
-        await status.edit_text(
-            TEXTS[language]["song_error"]
+        with open(file_path, "rb") as audio:
+            await query.message.reply_audio(
+                audio=audio,
+                title=title[:64],
+                filename="song.mp3",
+                read_timeout=120,
+                write_timeout=120
+            )
+
+    except Exception as error:
+        logger.exception("Song download error: %s", error)
+
+        await query.message.reply_text(
+            tr(context, "error")
         )
 
+    finally:
+        if temp:
+            temp.cleanup()
 
-# ==================================================
-# RENDER WEB SERVER
-# ==================================================
+        try:
+            await waiting.delete()
+        except Exception:
+            pass
 
-@web_
+
+# ==========================================
+# MAIN MESSAGE HANDLER
+# ==========================================
+
+async def message_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not update.message or not update.message.text:
+        return
+
+    message = update.message.text.strip()
+
+    # Buttons
+    if message == tr(context, "video"):
+        await update.message.reply_text(
+            tr(context, "send_link")
+        )
+        return
+
+    if message == tr(context, "music"):
+        await update.message.reply_text(
+            tr(context, "send_song")
+        )
+        return
+
+    if message == tr(context, "language"):
+        await language(update, context)
+        return
+
+    # Check URL
+    match = re.search(r"https?://\S+", message)
+
+    if match:
+        url = match.group(0).rstrip(".,!?)]}")
+
+        if not valid_url(url):
+            await update.message.reply_text(
+                tr(context, "unsupported")
+            )
+            return
+
+        await handle_video(url, update, context)
+        return
+
+    # Otherwise search music
+    if len(message) < 2:
+        await update.message.reply_text(
+            tr(context, "send_song")
+        )
+        return
+
+    if len(message) > 150:
+        await update.message.reply_text(
+            tr(context, "error")
+        )
+        return
+
+    await handle_search(message, update, context)
+
+
+# ==========================================
+# ERROR HANDLER
+# ==========================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    logger.error(
+        "Unexpected error: %s",
+        context.error,
+        exc_info=context.error
+    )
+
+
+# ==========================================
+# RUN BOT
+# ==========================================
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing!"
+        )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(8)
+        .connection_pool_size(16)
+        .pool_timeout(30)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("language", language)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            language_callback,
+            pattern=r"^lang_"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            audio_callback,
+            pattern=r"^aud_"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            song_callback,
+            pattern=r"^song_"
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_handler
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    logger.info("BOT STARTED SUCCESSFULLY!")
+
+    application.run_polling(
+   
